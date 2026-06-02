@@ -1,0 +1,73 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cambemul"
+version = "0.0.1"
+description = "Machine-learning emulator for CAMB cosmological power spectra"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+  { name = "yomori", email = "eos.xfc@gmail.com" },
+]
+keywords = [
+  "cosmology",
+  "CAMB",
+  "emulator",
+  "power spectrum",
+  "machine learning",
+  "jax",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Topic :: Scientific/Engineering :: Astronomy",
+  "Topic :: Scientific/Engineering :: Physics",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Operating System :: OS Independent",
+]
+dependencies = [
+  "numpy>=1.23",
+  "scipy>=1.9",
+  "jax>=0.4.13",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7",
+  "pytest-cov>=4",
+  "ruff>=0.5",
+  "mypy>=1.10",
+  "pre-commit>=3",
+]
+
+[project.urls]
+Homepage = "https://github.com/yomori/cambemul"
+Repository = "https://github.com/yomori/cambemul"
+Issues = "https://github.com/yomori/cambemul/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cambemul"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "N", "SIM"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --cov=cambemul --cov-report=term-missing"
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+files = ["src"]
