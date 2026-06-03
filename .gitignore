@@ -12,7 +12,7 @@ dist/
 htmlcov/
 .ipynb_checkpoints/
 scripts/__pycache__/
-
+scripts/logs/
 # Virtual envs
 .venv/
 venv/
