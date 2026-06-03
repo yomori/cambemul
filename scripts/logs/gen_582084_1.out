@@ -1,0 +1,13 @@
+Traceback (most recent call last):
+  File "/lcrc/project/SPT3G/users/ac.yomori/repo/cambemul/scripts/make_training.py", line 244, in <module>
+    main()
+  File "/lcrc/project/SPT3G/users/ac.yomori/repo/cambemul/scripts/make_training.py", line 79, in main
+    parsed = parse_cosmo_yaml(args.yaml)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/lcrc/project/SPT3G/users/ac.yomori/repo/cambemul/scripts/../src/cambemul/priors.py", line 92, in parse_cosmo_yaml
+    info = load_info(yaml_path)
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/lcrc/project/SPT3G/users/ac.yomori/repo/cambemul/scripts/../src/cambemul/priors.py", line 50, in load_info
+    with open(yaml_path) as f:
+         ^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: 'examples/lcdm.yaml'

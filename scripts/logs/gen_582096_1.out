@@ -1,0 +1,7 @@
+Traceback (most recent call last):
+  File "/lcrc/project/SPT3G/users/ac.yomori/repo/cambemul/scripts/make_training.py", line 244, in <module>
+    main()
+  File "/lcrc/project/SPT3G/users/ac.yomori/repo/cambemul/scripts/make_training.py", line 107, in main
+    idx = np.array_split(np.arange(args.n), args.nshard)[args.shard]
+          ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^
+IndexError: list index out of range

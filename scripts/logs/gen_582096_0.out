@@ -1,0 +1,13 @@
+[shard 0/1] 5 of 5 points
+  emulator inputs = ['ombh2', 'omch2', 'H0', 'logA', 'ns', 'tau']
+  sampling (prior) = ['ombh2', 'omch2', 'H0', 'logA', 'ns', 'tau']
+  fixed inputs    = {'mnu': 0.06}
+  extra_args      = {}
+  obs=['TT', 'EE', 'TE', 'PP']  derived=None  -> training/train.npz
+  0%|          | 0/5 [00:00<?, ?it/s] 20%|██        | 1/5 [00:14<00:56, 14.20s/it] 40%|████      | 2/5 [00:28<00:42, 14.01s/it] 60%|██████    | 3/5 [00:41<00:27, 13.78s/it] 80%|████████  | 4/5 [00:55<00:13, 13.66s/it]100%|██████████| 5/5 [01:08<00:00, 13.71s/it]100%|██████████| 5/5 [01:08<00:00, 13.77s/it]
+  kept 5 valid  |  camb_fail=0  invalid(NaN/inf/<=0)=0
+  TT : (5, 9199)
+  EE : (5, 9199)
+  TE : (5, 9199)
+  PP : (5, 9199)
+Saved 5 points -> training/train.npz

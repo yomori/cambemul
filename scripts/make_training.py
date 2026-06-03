@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 
 import numpy as np
 
@@ -103,6 +104,9 @@ def main():
         driving_specs = [(n, parsed["priors"][n]) for n in emu_names]
 
     # Deterministic full LHS draw; this task computes one contiguous slice.
+    if args.shard >= args.nshard:
+        print(f"[shard {args.shard}/{args.nshard}] index >= nshard; nothing to do.")
+        return
     driving_names, samples_all = lhs_box(driving_specs, args.n, seed=args.seed)
     idx = np.array_split(np.arange(args.n), args.nshard)[args.shard]
     samples = samples_all[idx]
@@ -196,6 +200,7 @@ def main():
         it = range(len(idx))
 
     # primary (space-filling LHS) slice
+    t_loop0 = time.time()
     for i in it:
         attempt(samples[i])
 
@@ -217,11 +222,20 @@ def main():
             print(f"  WARNING: only {len(param_rows)}/{quota} valid after "
                   f"{tries} extra tries (hit cap)")
 
+    loop_sec = time.time() - t_loop0
+    attempts = len(param_rows) + stats["camb_fail"] + stats["invalid"]
+    per_call = loop_sec / max(1, attempts)
+
     if not param_rows:
+        # still report timing so calibration runs are useful even on all-fail
+        print(f"[timing] camb_loop_sec={loop_sec:.3f} attempts={attempts} "
+              f"kept=0 per_call_sec={per_call:.4f}")
         sys.exit("No valid CAMB evaluations; nothing to save.")
 
     print(f"  kept {len(param_rows)} valid  |  camb_fail={stats['camb_fail']}  "
           f"invalid(NaN/inf/<=0)={stats['invalid']}")
+    print(f"[timing] camb_loop_sec={loop_sec:.3f} attempts={attempts} "
+          f"kept={len(param_rows)} per_call_sec={per_call:.4f}")
 
     out = dict(params=np.asarray(param_rows), param_names=np.array(emu_names),
                obs=np.array(obs), lmin=args.lmin, lmax=args.lmax,

@@ -2,41 +2,123 @@
 #SBATCH -t 12:00:00
 #SBATCH --partition=SPT3G
 #SBATCH --account=SPT3G
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=1
+#SBATCH --nodes=8
+#SBATCH --ntasks-per-node=16        # 16 tasks x 4 cores = 64 physical cores/node
+#SBATCH --cpus-per-task=4
+#SBATCH --hint=nomultithread        # physical cores only (best for CAMB; see note)
 #SBATCH --job-name=cambemul_gen
-#SBATCH --array=0-127%50
-#SBATCH --output=logs/gen_%A_%a.out
-#SBATCH --hint=nomultithread
+#SBATCH --output=logs/gen_%j.out
 
-# Sharded CAMB training-set generation.
-#   - NTOTAL points split across NSHARD array tasks (set NSHARD = array size).
-#   - Each task computes one contiguous slice of the SAME deterministic LHS draw.
-#   - %50 throttles to <=50 concurrent tasks (submit-cap friendly).
+# Packed multi-node CAMB generation with GNU parallel.
+#   - 8 nodes x 16 tasks = 128 concurrent CAMB evals, 4 cores each (OMP).
+#   - GNU parallel streams NSHARD small chunks through the 128 task slots with
+#     dynamic load balancing; each chunk runs via `srun --exclusive` so SLURM
+#     places it on a free slot on any node (and it inherits this conda env).
+#   - --joblog enables resume: rerun this script with PARALLEL_RESUME=1 to retry
+#     only the chunks that failed / didn't finish.
 #
-# No concatenation step: after the array finishes, point train_emulator.py
-# straight at the shard directory (it concatenates on the fly):
-#   python scripts/train_emulator.py --train training/lcdm_shards \
-#       --obs TT,EE,TE,PP,Pk --out-dir emulators --arch resnet --pca 256
+# Hyperthreading: CAMB is compute-bound, so physical cores (nomultithread) are
+# best. To try SMT instead, set --ntasks-per-node=32 and drop --hint line
+# (32 x 4 = 128 threads/node), then SLOTS becomes 256.
 
 eval "$(/lcrc/project/SPT3G/users/ac.yomori/packages/miniforge3/bin/conda shell.bash hook)"
 conda activate /lcrc/project/SPT3G/users/ac.yomori/packages/miniforge3/envs/analysis4
 
-export OMP_NUM_THREADS=1   # one CAMB thread per task; throughput from many tasks
+REPO="${CAMBEMUL_REPO:-/lcrc/project/SPT3G/users/ac.yomori/repo/cambemul}"
+cd "$REPO" || { echo "repo not found: $REPO"; exit 1; }
 mkdir -p logs
 
-YAML=examples/lcdm.yaml
-OBS=TT,EE,TE,PP,Pk
-NTOTAL=500000
-NSHARD=128                  # must equal the array size above (0-127)
-LMAX=3000
-KMAX=10
+PARALLEL=/lcrc/project/SPT3G/users/ac.yomori/packages/parallel-20220122/src/parallel
+export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-4}"   # CAMB threads per task
 
-python scripts/make_training.py \
-    --yaml   "$YAML" \
-    --obs    "$OBS" \
-    --n      "$NTOTAL" \
-    --nshard "$NSHARD" \
-    --shard  "$SLURM_ARRAY_TASK_ID" \
-    --shard-dir training/lcdm_shards \
-    --lmax "$LMAX" --kmax "$KMAX" --seed 0
+# ---- run settings ----
+YAML=/lcrc/project/SPT3G/users/ac.yomori/projects/spt3g_lensing_20192020/chains/qe/fid_cmb/data_camb_spalitetteete2/chain.updated.yaml
+OBS=uTT,uEE,uTE,PP
+DERIVED=sigma8,H0
+BOX=h0                 # use 'h0' for theta-parameterized chain yamls
+NTOTAL=524288
+NSHARD=2048               # many small chunks >> slots -> good load balancing
+LMAX=9200
+KMAX=10
+SHARDDIR=training/lcdm_shards
+
+SLOTS="${SLURM_NTASKS:-128}"                 # 8 * 16
+JOBLOG="logs/parallel_${SLURM_JOB_ID}.log"
+RESUME=""; [ -n "$PARALLEL_RESUME" ] && RESUME="--resume-failed"
+
+# ---- distribution stats ----
+PER=$(( NTOTAL / NSHARD ))                    # CAMB calls per chunk (floor)
+REM=$(( NTOTAL % NSHARD ))                    # first REM chunks get +1
+ROUNDS=$(( (NSHARD + SLOTS - 1) / SLOTS ))    # ceil(NSHARD/slots) = waves
+PERSLOT=$(( ROUNDS * PER ))                   # ~CAMB calls handled per slot
+NCORES="${SLURM_CPUS_PER_TASK:-4}"
+
+# pretty-print seconds -> "Xh Ym Zs"
+fmt() { local s=${1%.*}; printf "%dh %02dm %02ds" $((s/3600)) $(((s%3600)/60)) $((s%60)); }
+
+# ---- calibration: time ONE CAMB call on one task's worth of cores ----
+echo "Calibrating: 1 CAMB call on $NCORES cores (lmax=$LMAX) ..."
+CALDIR="training/.cal_${SLURM_JOB_ID}"
+t0=$SECONDS
+CALOUT=$(srun --exclusive -N1 -n1 -c "$NCORES" \
+    python scripts/make_training.py \
+        --yaml "$YAML" --obs "$OBS" --derived "$DERIVED" --box "$BOX" \
+        --n 1 --nshard 1 --shard 0 --shard-dir "$CALDIR" \
+        --lmax "$LMAX" --kmax "$KMAX" --seed 0 --require-valid 2>&1)
+WALL=$(( SECONDS - t0 ))                       # startup + 1 call
+rm -rf "$CALDIR"
+PERCALL=$(printf '%s\n' "$CALOUT" | sed -n 's/.*per_call_sec=\([0-9.]*\).*/\1/p' | tail -1)
+
+# estimates (assume ~all draws valid; --box h0 makes theta always solvable)
+EST=""
+if [ -n "$PERCALL" ]; then
+  read -r STARTUP TTASK TROUND TTOTAL < <(awk -v w="$WALL" -v pc="$PERCALL" \
+      -v per="$PER" -v rounds="$ROUNDS" 'BEGIN{
+        st = w - pc; if (st < 0) st = 0;
+        ttask = st + per*pc;
+        printf "%.0f %.0f %.0f %.0f", st, ttask, ttask, rounds*ttask }')
+  EST=1
+fi
+
+echo "============================================================"
+echo " cambemul generation plan"
+echo "   nodes               : ${SLURM_NNODES:-?}  (${SLURM_NTASKS_PER_NODE:-?} tasks/node x $NCORES cores, OMP=$OMP_NUM_THREADS)"
+echo "   concurrent slots    : $SLOTS"
+echo "   total CAMB calls    : $NTOTAL"
+echo "   tasks launched      : $NSHARD   (chunks streamed by GNU parallel)"
+if [ "$REM" -eq 0 ]; then
+  echo "   CAMB calls / task   : $PER"
+else
+  echo "   CAMB calls / task   : $PER or $((PER + 1))   ($REM chunks get +1)"
+fi
+echo "   rounds (waves)      : $ROUNDS   (= ceil NSHARD/slots)"
+echo "   CAMB calls / slot   : ~$PERSLOT over the run"
+if [ -n "$EST" ]; then
+  echo "   ----- measured -----"
+  echo "   per CAMB call       : ${PERCALL}s   ($NCORES cores, lmax=$LMAX)"
+  echo "   task startup        : ${STARTUP}s   (import + parse)"
+  echo "   ----- estimated wall time (assumes ~all draws valid) -----"
+  echo "   per task            : ~$(fmt "$TTASK")   ($PER calls + startup)"
+  echo "   per round           : ~$(fmt "$TROUND")"
+  echo "   FULL run ($ROUNDS rounds) : ~$(fmt "$TTOTAL")"
+else
+  echo "   *** calibration produced no timing (see calibration output above)"
+fi
+echo "   target dir          : $SHARDDIR   (yaml=$(basename "$YAML"), obs=$OBS, box=$BOX, lmax=$LMAX)"
+[ -n "$RESUME" ] && echo "   resume              : retrying only failed/unfinished chunks"
+if grep -q "cosmomc_theta" "$YAML" 2>/dev/null && [ "$BOX" != "h0" ]; then
+  echo "   *** WARNING: '$(basename "$YAML")' samples cosmomc_theta but BOX=$BOX."
+  echo "   ***          CAMB will reject ~every draw (theta->H0 solve). Use BOX=h0."
+fi
+echo "============================================================"
+
+seq 0 $((NSHARD - 1)) | "$PARALLEL" -j "$SLOTS" --joblog "$JOBLOG" $RESUME \
+    srun --exclusive -N1 -n1 -c "${SLURM_CPUS_PER_TASK:-4}" \
+        python scripts/make_training.py \
+            --yaml "$YAML" --obs "$OBS" --derived "$DERIVED" --box "$BOX" \
+            --n "$NTOTAL" --nshard "$NSHARD" --shard "{}" \
+            --shard-dir "$SHARDDIR" --lmax "$LMAX" --kmax "$KMAX" --seed 0 \
+            --require-valid
+
+echo "done. shards in $SHARDDIR ; then:"
+echo "  python scripts/train_emulator.py --train $SHARDDIR --obs $OBS --out-dir emulators --arch resnet --pca 256"
