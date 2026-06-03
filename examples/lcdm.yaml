@@ -1,0 +1,26 @@
+# Example cobaya-style YAML for cambemul.
+#
+# Only the `params` block is read. Varied parameters (those with a `prior`) are
+# Latin-hypercube sampled to build the training set; bare scalars are fixed and
+# passed to CAMB unchanged. Use CAMB-native names (H0, ombh2, omch2, ns, As|logA,
+# tau, mnu). `logA` is auto-converted to As = 1e-10 * exp(logA).
+params:
+  ombh2:
+    prior: {min: 0.020, max: 0.024}
+    latex: \Omega_\mathrm{b} h^2
+  omch2:
+    prior: {min: 0.10, max: 0.14}
+    latex: \Omega_\mathrm{c} h^2
+  H0:
+    prior: {min: 60.0, max: 75.0}
+    latex: H_0
+  logA:
+    prior: {min: 2.9, max: 3.2}
+    latex: \log(10^{10} A_\mathrm{s})
+  ns:
+    prior: {min: 0.94, max: 1.00}
+    latex: n_\mathrm{s}
+  tau:
+    prior: {min: 0.03, max: 0.08}
+    latex: \tau
+  mnu: 0.06        # fixed (eV)

@@ -36,7 +36,11 @@ classifiers = [
 dependencies = [
   "numpy>=1.23",
   "scipy>=1.9",
+  "pyyaml>=5.4",
   "jax>=0.4.13",
+  "optax>=0.1.7",
+  "camb>=1.5",
+  "tqdm>=4.60",
 ]
 
 [project.optional-dependencies]
