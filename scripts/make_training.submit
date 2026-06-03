@@ -1,0 +1,42 @@
+#!/bin/bash
+#SBATCH -t 12:00:00
+#SBATCH --partition=SPT3G
+#SBATCH --account=SPT3G
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=1
+#SBATCH --job-name=cambemul_gen
+#SBATCH --array=0-127%50
+#SBATCH --output=logs/gen_%A_%a.out
+#SBATCH --hint=nomultithread
+
+# Sharded CAMB training-set generation.
+#   - NTOTAL points split across NSHARD array tasks (set NSHARD = array size).
+#   - Each task computes one contiguous slice of the SAME deterministic LHS draw.
+#   - %50 throttles to <=50 concurrent tasks (submit-cap friendly).
+#
+# No concatenation step: after the array finishes, point train_emulator.py
+# straight at the shard directory (it concatenates on the fly):
+#   python scripts/train_emulator.py --train training/lcdm_shards \
+#       --obs TT,EE,TE,PP,Pk --out-dir emulators --arch resnet --pca 256
+
+eval "$(/lcrc/project/SPT3G/users/ac.yomori/packages/miniforge3/bin/conda shell.bash hook)"
+conda activate /lcrc/project/SPT3G/users/ac.yomori/packages/miniforge3/envs/analysis4
+
+export OMP_NUM_THREADS=1   # one CAMB thread per task; throughput from many tasks
+mkdir -p logs
+
+YAML=examples/lcdm.yaml
+OBS=TT,EE,TE,PP,Pk
+NTOTAL=500000
+NSHARD=128                  # must equal the array size above (0-127)
+LMAX=3000
+KMAX=10
+
+python scripts/make_training.py \
+    --yaml   "$YAML" \
+    --obs    "$OBS" \
+    --n      "$NTOTAL" \
+    --nshard "$NSHARD" \
+    --shard  "$SLURM_ARRAY_TASK_ID" \
+    --shard-dir training/lcdm_shards \
+    --lmax "$LMAX" --kmax "$KMAX" --seed 0

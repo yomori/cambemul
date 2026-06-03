@@ -16,6 +16,8 @@ import argparse
 import os
 import sys
 
+import numpy as np
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from cambemul.dataset import load_store, read_obs, read_param_names  # noqa: E402
 from cambemul.emulator import fit, save, target_transform  # noqa: E402
@@ -73,6 +75,22 @@ def main():
             extra.update(ell=store["ell"])
         out = os.path.join(args.out_dir, f"emu_{o}.npz")
         save(out, params, meta, extra=extra)
+        print(f"  best val_mse={best_val:.4e}  ->  {out}")
+
+    # Derived scalars (e.g. sigma8, H0): one small emulator, linear transform.
+    if "derived" in store and "derived_names" in store:
+        dnames = [str(x) for x in store["derived_names"]]
+        Y = store["derived"]
+        print(f"\n=== derived {dnames}  (transform=linear, D={Y.shape[1]}) ===")
+        params, meta, best_val = fit(
+            X, Y, transform="linear", arch=args.arch, pca=0,
+            width=args.width, depth=args.depth, epochs=args.epochs, lr=args.lr,
+            batch=args.batch, val_frac=args.val_frac, patience=args.patience,
+            seed=args.seed,
+        )
+        out = os.path.join(args.out_dir, "emu_derived.npz")
+        save(out, params, meta, extra=dict(obs="derived", param_names=param_names,
+                                           derived_names=np.array(dnames)))
         print(f"  best val_mse={best_val:.4e}  ->  {out}")
 
 
