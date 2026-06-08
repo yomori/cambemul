@@ -31,8 +31,18 @@ generation + training steps and load one directly. Downloads use
 
 ```bash
 pip install gdown            # or:  pip install "cambemul[download]"
+```
 
-# download an emulator directory (a folder of emu_*.npz files) into emulators/
+The easiest way is the helper script, which grabs **all** published emulators at
+once instead of downloading them one by one:
+
+```bash
+bash scripts/get_emulators.sh            # -> emulators/
+```
+
+Or fetch a single emulator directory by hand (a folder of `emu_*.npz` files):
+
+```bash
 gdown --folder https://drive.google.com/drive/folders/<FOLDER_ID> -O emulators/<name>
 ```
 
