@@ -66,6 +66,37 @@ def inv_transform(t, kind):
     return 10.0 ** t if kind == "log10" else t
 
 
+def accuracy_report(obs, y_true, y_pred, ell=None):
+    """Held-out precision of an emulator: per-(sample, bin) error percentiles.
+
+    Positive spectra use fractional error |pred-true|/|true|; sign-changing TE
+    uses |pred-true| / per-bin RMS. Returns a JSON-friendly dict (median, 68/95/
+    99/max percentiles, fraction of bins within 0.1%/1%, and per-ell-band medians).
+    """
+    yt, yp = np.asarray(y_true, float), np.asarray(y_pred, float)
+    if obs in LINEAR_OBS:
+        err = np.abs(yp - yt) / (np.sqrt(np.mean(yt ** 2, axis=0)) + 1e-300)
+        metric = "err/RMS"
+    else:
+        err = np.abs(yp - yt) / (np.abs(yt) + 1e-300)
+        metric = "fractional"
+    p = np.percentile(err, [50, 68, 95, 99, 100])
+    rep = dict(metric=metric, n_test=int(yt.shape[0]),
+               median=float(p[0]), p68=float(p[1]), p95=float(p[2]),
+               p99=float(p[3]), max=float(p[4]),
+               within_0p1pct=float(100.0 * np.mean(err < 1e-3)),
+               within_1pct=float(100.0 * np.mean(err < 1e-2)))
+    if ell is not None and err.ndim == 2:
+        ell = np.asarray(ell)
+        lmax = int(ell[-1])
+        edges = [e for e in (2, 30, 300, 2000) if e < lmax] + [lmax + 1]
+        _k = lambda v: f"{v // 1000}k" if v >= 1000 else str(v)
+        rep["bands"] = [[f"{_k(lo)}-{_k(hi - 1)}",
+                         float(np.median(err[:, (ell >= lo) & (ell < hi)]))]
+                        for lo, hi in zip(edges[:-1], edges[1:])]
+    return rep
+
+
 # --------------------------------------------------------------------------- #
 # Backbones
 # --------------------------------------------------------------------------- #
@@ -359,6 +390,42 @@ class Emulator:
             elif "ell" in ex:
                 self.ell = ex["ell"]
 
+        # held-out precision recorded at train time (optional)
+        self.accuracy = {}
+        for o, (_, _, ex) in self.members.items():
+            aj = ex.get("accuracy_json")
+            if aj is not None:
+                try:
+                    self.accuracy[o] = json.loads(str(aj))
+                except Exception:
+                    pass
+
+    def print_precision(self):
+        """Print the held-out precision stored with each emulator (if any)."""
+        if not self.accuracy:
+            print(f"cambemul.Emulator(obs={self.obs}) "
+                  "[no stored precision: re-train to record it]")
+            return
+        grid = ""
+        if self.ell is not None:
+            grid = f"  nell={len(self.ell)} (ell {int(self.ell[0])}..{int(self.ell[-1])})"
+        print(f"cambemul.Emulator loaded: obs={self.obs}")
+        print(f"  params={self.param_names}{grid}")
+        print("  held-out precision   [median | 95% | max | within 1%]:")
+        for o in self.obs:
+            a = self.accuracy.get(o)
+            if not a:
+                continue
+            if a.get("metric") == "derived":
+                ds = ",  ".join(f"{nm} {med * 100:.2f}%"
+                                for nm, med, *_ in a["params"])
+                print(f"    derived   {ds}")
+            else:
+                print(f"    {o:<6s} {a['metric']:<8s} "
+                      f"{a['median'] * 100:6.2f}% | {a['p95'] * 100:6.2f}% | "
+                      f"{a['max'] * 100:6.1f}% | {a['within_1pct']:4.0f}%"
+                      f"   (n_test={a['n_test']})")
+
     def __repr__(self):
         return (f"Emulator(obs={self.obs}, "
                 f"params={self.param_names}, "
@@ -448,11 +515,12 @@ class Emulator:
         return self.kh, self.z, self.predict(pars)["Pk"]
 
 
-def loademul(path):
+def loademul(path, verbose=True):
     """Load an :class:`Emulator`.
 
     ``path`` may be a directory of ``emu_*.npz`` files (as written by
-    ``train_emulator.py``) or a single ``emu_<OBS>.npz`` file.
+    ``train_emulator.py``) or a single ``emu_<OBS>.npz`` file. When ``verbose``
+    (default), the emulator's stored held-out precision is printed on load.
     """
     import glob
     import os
@@ -467,4 +535,7 @@ def loademul(path):
     for f in files:
         params, meta, extra = load(f)
         members[str(extra["obs"])] = (params, meta, extra)
-    return Emulator(members)
+    emu = Emulator(members)
+    if verbose:
+        emu.print_precision()
+    return emu

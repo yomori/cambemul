@@ -34,6 +34,7 @@ from cambemul.priors import (  # noqa: E402
     invert_linear_lambda,
     lhs_box,
     parse_cosmo_yaml,
+    sample_posterior,
 )
 from cambemul.theory import LINEAR_OBS, run_camb  # noqa: E402
 
@@ -56,14 +57,23 @@ def main():
     ap.add_argument("--derived", default="",
                     help="comma list of derived scalars to also emulate, "
                          "e.g. 'sigma8,H0' (sigma8 forces the matter transfer)")
-    ap.add_argument("--box", choices=["prior", "h0"], default="prior",
+    ap.add_argument("--box", choices=["prior", "h0", "posterior"], default="prior",
                     help="prior: sample the yaml prior directly. "
-                         "h0: for theta-parameterized yamls, sample H0 instead of "
-                         "cosmomc_theta (no theta->H0 solve, zero rejections) and "
-                         "store CAMB's derived theta as the emulator input.")
+                         "h0: theta-parameterized yamls, sample H0 instead of "
+                         "cosmomc_theta (zero rejections). "
+                         "posterior: LHS over the +/-WIDEN-sigma posterior of an "
+                         "existing chain (--posterior); the right box for an emulator.")
+    ap.add_argument("--posterior", default=None,
+                    help="chain root for --box posterior, e.g. /path/to/chain "
+                         "(reads chain.1.txt, chain.2.txt, ...)")
+    ap.add_argument("--widen", type=float, default=3.0,
+                    help="posterior box half-width in sigma units (default 3)")
     ap.add_argument("--h0-range", default=None,
                     help="'lo,hi' for the H0 route (default: theory.camb "
                          "theta_H0_range, else 40,100)")
+    ap.add_argument("--skip-existing", action="store_true",
+                    help="if this shard's output .npz already exists and loads, "
+                         "skip it (idempotent resume after a kill)")
     ap.add_argument("--require-valid", action="store_true",
                     help="top up with extra draws until this shard has its full "
                          "quota of VALID points (replaces CAMB failures / NaNs)")
@@ -83,13 +93,26 @@ def main():
     if not emu_names:
         sys.exit(f"No sampled cosmological parameters found in {args.yaml}")
 
+    post_mode = args.box == "posterior"
     h0_mode = args.box == "h0" and parsed["theta_param"] is not None
     if args.box == "h0" and not h0_mode:
         print("  [note] --box h0 ignored: yaml is not theta-parameterized "
               "(no cosmomc_theta lambda); sampling the prior directly.")
 
     # Build the DRIVING sampling specs (what we actually LHS-sample).
-    if h0_mode:
+    driving_specs = None
+    if post_mode:
+        if not args.posterior:
+            sys.exit("--box posterior requires --posterior <chain root>")
+        # widen the theta->H0 search so CAMB can solve the widened-posterior
+        # theta range (the unsolvable extreme tail is dropped by --require-valid)
+        if args.h0_range:
+            lo, hi = (float(x) for x in args.h0_range.split(","))
+        else:
+            lo, hi = 20.0, 150.0
+        extra_args = dict(extra_args)
+        extra_args["theta_H0_range"] = [lo, hi]
+    elif h0_mode:
         tp = parsed["theta_param"]
         theta_sampled = tp["sampled"]
         if args.h0_range:
@@ -103,11 +126,15 @@ def main():
     else:
         driving_specs = [(n, parsed["priors"][n]) for n in emu_names]
 
-    # Deterministic full LHS draw; this task computes one contiguous slice.
+    # Deterministic full draw; this task computes one contiguous slice.
     if args.shard >= args.nshard:
         print(f"[shard {args.shard}/{args.nshard}] index >= nshard; nothing to do.")
         return
-    driving_names, samples_all = lhs_box(driving_specs, args.n, seed=args.seed)
+    if post_mode:
+        driving_names, samples_all = sample_posterior(
+            parsed, args.posterior, args.n, widen=args.widen, seed=args.seed)
+    else:
+        driving_names, samples_all = lhs_box(driving_specs, args.n, seed=args.seed)
     idx = np.array_split(np.arange(args.n), args.nshard)[args.shard]
     samples = samples_all[idx]
 
@@ -119,10 +146,22 @@ def main():
     else:
         out_path = args.out or "training/train.npz"
 
+    # idempotent resume: if this shard's file already exists and loads, skip it
+    if args.skip_existing and os.path.exists(out_path):
+        try:
+            with np.load(out_path, allow_pickle=True) as _z:
+                _ = _z["params"]
+            print(f"[skip] {out_path} exists; skipping shard {args.shard}")
+            return
+        except Exception:
+            print(f"[skip] {out_path} unreadable; recomputing shard {args.shard}")
+
     print(f"[shard {args.shard}/{args.nshard}] {len(idx)} of {args.n} points")
     print(f"  emulator inputs = {emu_names}")
     print(f"  sampling ({args.box}) = {driving_names}"
-          + (f"  H0 in [{lo},{hi}]" if h0_mode else ""))
+          + (f"  H0 in [{lo},{hi}]" if h0_mode else "")
+          + (f"  widen={args.widen}sigma, theta_H0_range=[{lo},{hi}]"
+             if post_mode else ""))
     print(f"  fixed inputs    = {parsed['fixed']}")
     print(f"  extra_args      = {extra_args}")
     print(f"  obs={obs}  derived={derived_names or None}  -> {out_path}")
@@ -211,8 +250,13 @@ def main():
         cap, tries = int(args.maxtries_factor * quota), 0
         print(f"  top-up: {len(param_rows)}/{quota} valid; drawing extras (cap {cap})")
         while len(param_rows) < quota and tries < cap:
-            _, extra = iid_box(driving_specs,
-                               max(1, (quota - len(param_rows)) * 2), rng)
+            need = max(1, (quota - len(param_rows)) * 2)
+            if post_mode:
+                _, extra = sample_posterior(
+                    parsed, args.posterior, need, widen=args.widen,
+                    seed=args.seed + 100_003 + tries)
+            else:
+                _, extra = iid_box(driving_specs, need, rng)
             for rowvals in extra:
                 tries += 1
                 attempt(rowvals)

@@ -20,6 +20,7 @@ parameters whose names are CAMB-native.
 from __future__ import annotations
 
 import math
+import os
 
 import numpy as np
 import yaml
@@ -195,6 +196,61 @@ def draw_from_priors(parsed: dict, names, n: int, rng) -> np.ndarray:
     for j, nm in enumerate(names):
         out[:, j] = _sample_prior_1d(parsed["priors"][nm], u[:, j])
     return out
+
+
+def _load_chain(chain_root: str, names, burnin: float = 0.3):
+    """Load weighted samples for `names` from a cobaya getdist-format chain.
+
+    chain_root e.g. '/path/chain' -> reads chain.1.txt, chain.2.txt, ...
+    Returns (X[M, d], weights[M]); drops the first `burnin` fraction per file.
+    """
+    import glob
+    import re
+
+    base = os.path.basename(chain_root)
+    pat = re.compile(re.escape(base) + r"\.\d+\.txt$")
+    files = sorted(f for f in glob.glob(chain_root + ".*.txt")
+                   if pat.match(os.path.basename(f)))
+    if not files:
+        raise FileNotFoundError(f"no chain files {chain_root}.<n>.txt")
+    hdr = open(files[0]).readline().lstrip("#").split()
+    col = {h: i for i, h in enumerate(hdr)}
+    missing = [n for n in names if n not in col]
+    if missing:
+        raise KeyError(f"params {missing} not in chain header {hdr[:12]}")
+    idx = [col[n] for n in names]
+    Xs, ws = [], []
+    for f in files:
+        d = np.loadtxt(f)
+        if d.ndim == 1:
+            d = d[None, :]
+        nb = int(burnin * d.shape[0])
+        Xs.append(d[nb:, idx])
+        ws.append(d[nb:, col["weight"]])
+    return np.concatenate(Xs, 0), np.concatenate(ws)
+
+
+def sample_posterior(parsed: dict, chain_root: str, n: int,
+                     widen: float = 3.0, seed: int = 0, burnin: float = 0.3):
+    """Latin-hypercube sample a WIDENED posterior of the emulator's params.
+
+    Reads the posterior mean mu and covariance C from `chain_root`, then draws a
+    space-filling LHS uniformly over the box [-widen, +widen]^d in whitened
+    (sigma) units and maps it through C's Cholesky factor:  x = mu + L @ z.
+    This covers the +/- widen-sigma posterior region (including its degeneracy
+    directions) uniformly -- the right training distribution for an emulator.
+
+    Returns (names, X[n, d]).
+    """
+    names = parsed["sampled"]
+    X, w = _load_chain(chain_root, names, burnin=burnin)
+    mu = np.average(X, axis=0, weights=w)
+    C = np.cov(X.T, aweights=w)
+    L = np.linalg.cholesky(C)
+    u = qmc.LatinHypercube(d=len(names), seed=seed).random(n)
+    z = widen * (2.0 * u - 1.0)                # uniform in [-widen, widen]^d
+    Xs = mu + z @ L.T
+    return names, Xs
 
 
 def build_camb_inputs(parsed: dict, row: dict) -> dict:

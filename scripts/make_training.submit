@@ -1,25 +1,29 @@
 #!/bin/bash
-#SBATCH -t 12:00:00
+#SBATCH -t 36:00:00
 #SBATCH --partition=SPT3G
 #SBATCH --account=SPT3G
 #SBATCH --nodes=8
-#SBATCH --ntasks-per-node=16        # 16 tasks x 4 cores = 64 physical cores/node
-#SBATCH --cpus-per-task=4
+#SBATCH --ntasks-per-node=32        # 32 tasks x 2 cores = 64 physical cores/node
+#SBATCH --cpus-per-task=2
 #SBATCH --hint=nomultithread        # physical cores only (best for CAMB; see note)
 #SBATCH --job-name=cambemul_gen
 #SBATCH --output=logs/gen_%j.out
 
 # Packed multi-node CAMB generation with GNU parallel.
-#   - 8 nodes x 16 tasks = 128 concurrent CAMB evals, 4 cores each (OMP).
-#   - GNU parallel streams NSHARD small chunks through the 128 task slots with
+#   - 8 nodes x 32 tasks = 256 concurrent CAMB evals, 2 cores each (OMP).
+#     (CAMB's OpenMP scaling is sublinear, so more 2-core tasks generally beat
+#     fewer 4-core tasks for aggregate throughput.)
+#   - GNU parallel streams NSHARD small chunks through the task slots with
 #     dynamic load balancing; each chunk runs via `srun --exclusive` so SLURM
 #     places it on a free slot on any node (and it inherits this conda env).
-#   - --joblog enables resume: rerun this script with PARALLEL_RESUME=1 to retry
-#     only the chunks that failed / didn't finish.
+#   - Resume is automatic & exact: shards are deterministic (fixed-seed LHS), and
+#     a STABLE joblog (keyed to shard-dir + NSHARD) lets a resubmit skip finished
+#     shards and rerun only failed/killed ones. --skip-existing is a filesystem
+#     safety net. Set FRESH=1 to wipe the joblog and start over.
 #
 # Hyperthreading: CAMB is compute-bound, so physical cores (nomultithread) are
-# best. To try SMT instead, set --ntasks-per-node=32 and drop --hint line
-# (32 x 4 = 128 threads/node), then SLOTS becomes 256.
+# best. To try SMT instead, set --ntasks-per-node=64 and drop --hint line
+# (64 x 2 = 128 threads/node), then SLOTS becomes 512.
 
 eval "$(/lcrc/project/SPT3G/users/ac.yomori/packages/miniforge3/bin/conda shell.bash hook)"
 conda activate /lcrc/project/SPT3G/users/ac.yomori/packages/miniforge3/envs/analysis4
@@ -32,19 +36,38 @@ PARALLEL=/lcrc/project/SPT3G/users/ac.yomori/packages/parallel-20220122/src/para
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-4}"   # CAMB threads per task
 
 # ---- run settings ----
-YAML=/lcrc/project/SPT3G/users/ac.yomori/projects/spt3g_lensing_20192020/chains/qe/fid_cmb/data_camb_spalitetteete2/chain.updated.yaml
+YAML=/lcrc/project/SPT3G/users/ac.yomori/projects/spt3g_lensing_20192020/chains/qe/fid_lens/data_camb_gmvspafg/chain.updated.yaml
 OBS=uTT,uEE,uTE,PP
 DERIVED=sigma8,H0
-BOX=h0                 # use 'h0' for theta-parameterized chain yamls
-NTOTAL=524288
-NSHARD=2048               # many small chunks >> slots -> good load balancing
-LMAX=9200
-KMAX=10
-SHARDDIR=training/lcdm_shards
+BOX=posterior          # 'prior' | 'h0' (theta yamls) | 'posterior' (widened chain)
+POSTERIOR=/lcrc/project/SPT3G/users/ac.yomori/projects/spt3g_lensing_20192020/chains/qe/fid_lens/data_camb_gmvspafg/chain
+WIDEN=5                # posterior box half-width in sigma (the "bloat" factor)
+H0RANGE=20,150         # widened theta->H0 search so the broad-theta tail solves
+NTOTAL=131072
+NSHARD=1024               # many small chunks >> slots -> good load balancing
+LMAX=4000                 # match the analysis yaml's extra_args lmax (much faster)
+KMAX=5
+SHARDDIR=training/gmvspafg_post5sig
 
-SLOTS="${SLURM_NTASKS:-128}"                 # 8 * 16
-JOBLOG="logs/parallel_${SLURM_JOB_ID}.log"
-RESUME=""; [ -n "$PARALLEL_RESUME" ] && RESUME="--resume-failed"
+# extra CLI flags selected by box type
+POSTARGS=""
+if [ "$BOX" = "posterior" ]; then
+  POSTARGS="--posterior $POSTERIOR --widen $WIDEN --h0-range $H0RANGE"
+elif [ "$BOX" = "h0" ] && [ -n "${H0RANGE:-}" ]; then
+  POSTARGS="--h0-range $H0RANGE"
+fi
+
+# concurrent task slots. SLURM_NTASKS can be under-reported (= nnodes) when only
+# --ntasks-per-node is set, so take the max with nodes*tasks-per-node.
+_A="${SLURM_NTASKS:-0}"
+_B=$(( ${SLURM_NNODES:-0} * ${SLURM_NTASKS_PER_NODE:-0} ))
+SLOTS=$(( _A > _B ? _A : _B ))
+[ "$SLOTS" -lt 1 ] && SLOTS=128
+# STABLE joblog (per shard-dir + NSHARD), so a resubmit auto-resumes: GNU parallel
+# skips finished shards and reruns failed/killed ones. Set FRESH=1 to start over.
+JOBLOG="logs/$(basename "$SHARDDIR")_n${NSHARD}.joblog"
+[ -n "$FRESH" ] && rm -f "$JOBLOG"
+RESUME="--resume-failed"
 
 # ---- distribution stats ----
 PER=$(( NTOTAL / NSHARD ))                    # CAMB calls per chunk (floor)
@@ -62,7 +85,7 @@ CALDIR="training/.cal_${SLURM_JOB_ID}"
 t0=$SECONDS
 CALOUT=$(srun --exclusive -N1 -n1 -c "$NCORES" \
     python scripts/make_training.py \
-        --yaml "$YAML" --obs "$OBS" --derived "$DERIVED" --box "$BOX" \
+        --yaml "$YAML" --obs "$OBS" --derived "$DERIVED" --box "$BOX" $POSTARGS \
         --n 1 --nshard 1 --shard 0 --shard-dir "$CALDIR" \
         --lmax "$LMAX" --kmax "$KMAX" --seed 0 --require-valid 2>&1)
 WALL=$(( SECONDS - t0 ))                       # startup + 1 call
@@ -105,20 +128,37 @@ else
   echo "   *** calibration produced no timing (see calibration output above)"
 fi
 echo "   target dir          : $SHARDDIR   (yaml=$(basename "$YAML"), obs=$OBS, box=$BOX, lmax=$LMAX)"
+if [ "$BOX" = "posterior" ]; then
+  echo "   posterior box       : ${WIDEN}sigma around $(basename "$(dirname "$POSTERIOR")"), theta_H0_range=[$H0RANGE]"
+  echo "   note                : --require-valid backfills the unsolvable theta tail"
+  echo "                         (~25% rejected at 5sigma); real wall ~1.3x estimate."
+fi
 [ -n "$RESUME" ] && echo "   resume              : retrying only failed/unfinished chunks"
-if grep -q "cosmomc_theta" "$YAML" 2>/dev/null && [ "$BOX" != "h0" ]; then
+if grep -q "cosmomc_theta" "$YAML" 2>/dev/null && [ "$BOX" = "prior" ]; then
   echo "   *** WARNING: '$(basename "$YAML")' samples cosmomc_theta but BOX=$BOX."
-  echo "   ***          CAMB will reject ~every draw (theta->H0 solve). Use BOX=h0."
+  echo "   ***          CAMB will reject ~every draw (theta->H0 solve). Use BOX=h0 or posterior."
 fi
 echo "============================================================"
 
-seq 0 $((NSHARD - 1)) | "$PARALLEL" -j "$SLOTS" --joblog "$JOBLOG" $RESUME \
-    srun --exclusive -N1 -n1 -c "${SLURM_CPUS_PER_TASK:-4}" \
-        python scripts/make_training.py \
-            --yaml "$YAML" --obs "$OBS" --derived "$DERIVED" --box "$BOX" \
-            --n "$NTOTAL" --nshard "$NSHARD" --shard "{}" \
-            --shard-dir "$SHARDDIR" --lmax "$LMAX" --kmax "$KMAX" --seed 0 \
-            --require-valid
+# ONE srun step with NTASKS tasks, spread evenly by SLURM (32/node x 8 = 256),
+# each bound to its own cores. Each task processes a STRIDED set of shards
+# (procid, procid+NTASKS, ...). This creates a single step -- no per-task `srun`,
+# so no "step creation temporarily disabled" throttling and no pileup on one node
+# -- and --skip-existing makes it resume-safe (finished shards skipped instantly).
+# Static stride assignment replaces GNU parallel's dynamic balancing, which is
+# fine at ~NSHARD/NTASKS shards per task.
+export YAML OBS DERIVED BOX POSTARGS NTOTAL NSHARD LMAX KMAX SHARDDIR REPO
+srun -N "${SLURM_NNODES:-8}" --ntasks-per-node="${SLURM_NTASKS_PER_NODE:-32}" \
+     --cpus-per-task="${SLURM_CPUS_PER_TASK:-2}" --hint=nomultithread \
+  bash -c '
+    cd "$REPO" || exit 1
+    for s in $(seq "$SLURM_PROCID" "$SLURM_NTASKS" $((NSHARD - 1))); do
+      python scripts/make_training.py \
+        --yaml "$YAML" --obs "$OBS" --derived "$DERIVED" --box "$BOX" $POSTARGS \
+        --n "$NTOTAL" --nshard "$NSHARD" --shard "$s" \
+        --shard-dir "$SHARDDIR" --lmax "$LMAX" --kmax "$KMAX" --seed 0 \
+        --require-valid --skip-existing || true
+    done'
 
 echo "done. shards in $SHARDDIR ; then:"
 echo "  python scripts/train_emulator.py --train $SHARDDIR --obs $OBS --out-dir emulators --arch resnet --pca 256"

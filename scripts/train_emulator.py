@@ -13,6 +13,7 @@ emulator file per observable: emulators/emu_<OBS>.npz.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 
@@ -20,7 +21,9 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from cambemul.dataset import load_store, read_obs, read_param_names  # noqa: E402
-from cambemul.emulator import fit, save, target_transform  # noqa: E402
+from cambemul.emulator import (  # noqa: E402
+    accuracy_report, fit, predict, save, target_transform,
+)
 
 
 def main():
@@ -38,6 +41,9 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--batch", type=int, default=256)
     ap.add_argument("--val-frac", type=float, default=0.1)
+    ap.add_argument("--test-frac", type=float, default=0.1,
+                    help="fraction held out to measure the precision that gets "
+                         "stored in (and printed on load of) each emulator")
     ap.add_argument("--patience", type=int, default=50)
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
@@ -49,8 +55,17 @@ def main():
     obs = [o.strip() for o in args.obs.split(",")] if args.obs else file_obs
     os.makedirs(args.out_dir, exist_ok=True)
 
+    # Hold out a test split (never seen by fit) to record honest precision.
+    rng = np.random.default_rng(args.seed + 12345)
+    Ntot = X.shape[0]
+    perm = rng.permutation(Ntot)
+    nte = max(1, int(args.test_frac * Ntot))
+    te_idx, tr_idx = perm[:nte], perm[nte:]
+    Xtr, Xte = X[tr_idx], X[te_idx]
+
     print(f"Training set: {args.train}")
-    print(f"  N={X.shape[0]}  params={param_names}")
+    print(f"  N={Ntot}  ({len(tr_idx)} train / {len(te_idx)} held-out)  "
+          f"params={param_names}")
     print(f"  obs in file: {file_obs} -> training: {obs}")
     print(f"  arch={args.arch}  pca={args.pca}  width={args.width}  depth={args.depth}")
 
@@ -62,20 +77,24 @@ def main():
         transform = target_transform(o)
         print(f"\n=== {o}  (transform={transform}, D={Y.shape[1]}) ===")
         params, meta, best_val = fit(
-            X, Y, transform=transform, arch=args.arch, pca=args.pca,
+            Xtr, Y[tr_idx], transform=transform, arch=args.arch, pca=args.pca,
             width=args.width, depth=args.depth, epochs=args.epochs, lr=args.lr,
             batch=args.batch, val_frac=args.val_frac, patience=args.patience,
             seed=args.seed,
         )
+        ell_grid = None if o == "Pk" else store["ell"]
+        acc = accuracy_report(o, Y[te_idx], predict(params, meta, Xte), ell=ell_grid)
         extra = dict(obs=o, param_names=param_names, lmin=store["lmin"],
-                     lmax=store["lmax"])
+                     lmax=store["lmax"], accuracy_json=json.dumps(acc))
         if o == "Pk":
             extra.update(kh=store["kh"], z=store["z"], Pk_shape=store["Pk_shape"])
         else:
             extra.update(ell=store["ell"])
         out = os.path.join(args.out_dir, f"emu_{o}.npz")
         save(out, params, meta, extra=extra)
-        print(f"  best val_mse={best_val:.4e}  ->  {out}")
+        print(f"  best val_mse={best_val:.4e}  |  held-out {acc['metric']}: "
+              f"median={acc['median'] * 100:.2f}% 95%={acc['p95'] * 100:.2f}% "
+              f"->  {out}")
 
     # Derived scalars (e.g. sigma8, H0): one small emulator, linear transform.
     if "derived" in store and "derived_names" in store:
@@ -83,15 +102,24 @@ def main():
         Y = store["derived"]
         print(f"\n=== derived {dnames}  (transform=linear, D={Y.shape[1]}) ===")
         params, meta, best_val = fit(
-            X, Y, transform="linear", arch=args.arch, pca=0,
+            Xtr, Y[tr_idx], transform="linear", arch=args.arch, pca=0,
             width=args.width, depth=args.depth, epochs=args.epochs, lr=args.lr,
             batch=args.batch, val_frac=args.val_frac, patience=args.patience,
             seed=args.seed,
         )
+        dpred, dtrue = predict(params, meta, Xte), Y[te_idx]
+        dparams = []
+        for j, nm in enumerate(dnames):
+            e = np.abs(dpred[:, j] - dtrue[:, j]) / (np.abs(dtrue[:, j]) + 1e-300)
+            q = np.percentile(e, [50, 95, 100])
+            dparams.append([nm, float(q[0]), float(q[1]), float(q[2])])
+        acc = dict(metric="derived", n_test=int(len(te_idx)), params=dparams)
         out = os.path.join(args.out_dir, "emu_derived.npz")
         save(out, params, meta, extra=dict(obs="derived", param_names=param_names,
-                                           derived_names=np.array(dnames)))
-        print(f"  best val_mse={best_val:.4e}  ->  {out}")
+                                           derived_names=np.array(dnames),
+                                           accuracy_json=json.dumps(acc)))
+        print("  derived precision: " + ", ".join(
+            f"{nm} {med * 100:.2f}%" for nm, med, *_ in dparams) + f"  ->  {out}")
 
 
 if __name__ == "__main__":
