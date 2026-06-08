@@ -23,6 +23,44 @@ pip install -e ".[dev]"
 
 Requires `camb`, `cobaya`, `jax`, `flax`, `optax`, `numpy`, `scipy`, `pyyaml`.
 
+## Precomputed emulators
+
+Pretrained emulators are hosted on Google Drive, so you can skip the CAMB
+generation + training steps and load one directly. Downloads use
+[`gdown`](https://github.com/wkentaro/gdown) (install it with pip):
+
+```bash
+pip install gdown            # or:  pip install "cambemul[download]"
+
+# download an emulator directory (a folder of emu_*.npz files) into emulators/
+gdown --folder https://drive.google.com/drive/folders/<FOLDER_ID> -O emulators/<name>
+```
+
+Replace `<FOLDER_ID>` with the share id of the emulator you want (see the table
+below), then load and use it — each emulator prints its held-out precision on
+load:
+
+```python
+import cambemul
+e = cambemul.loademul("emulators/<name>")        # prints per-observable precision
+out = e.predict({"theta_MC_100": 1.0411, "logA": 3.05, "ns": 0.965,
+                 "ombh2": 0.0224, "omch2": 0.109})
+out["tt"], out["ee"], out["te"], out["pp"]
+```
+
+Or run the ready-made example, which loads an emulator and predicts the spectra
+at a (Planck-ish) fiducial point — overridable, with an optional `D_ell` plot:
+
+```bash
+python scripts/predict_example.py --emu-dir emulators/<name>
+python scripts/predict_example.py --emu-dir emulators/<name> \
+    --params "logA=3.00,ns=0.97" --plot dell.png
+```
+
+| emulator | params | observables | Google Drive id |
+|----------|--------|-------------|-----------------|
+| _(add rows as you publish emulators)_ | | | `<FOLDER_ID>` |
+
 ## Usage
 
 The workflow is three scripts plus a one-line load:

@@ -41,6 +41,7 @@ dependencies = [
   "optax>=0.1.7",
   "camb>=1.5",
   "tqdm>=4.60",
+  "tabulate>=0.9",
 ]
 
 [project.optional-dependencies]
@@ -50,6 +51,9 @@ dev = [
   "ruff>=0.5",
   "mypy>=1.10",
   "pre-commit>=3",
+]
+download = [
+  "gdown>=4.6",          # download precomputed emulators from Google Drive
 ]
 
 [project.urls]

@@ -411,20 +411,34 @@ class Emulator:
             grid = f"  nell={len(self.ell)} (ell {int(self.ell[0])}..{int(self.ell[-1])})"
         print(f"cambemul.Emulator loaded: obs={self.obs}")
         print(f"  params={self.param_names}{grid}")
-        print("  held-out precision   [median | 95% | max | within 1%]:")
+
+        def _pct(x):
+            return f"{x * 100:.2f}%"
+
+        rows = []
         for o in self.obs:
             a = self.accuracy.get(o)
             if not a:
                 continue
             if a.get("metric") == "derived":
-                ds = ",  ".join(f"{nm} {med * 100:.2f}%"
-                                for nm, med, *_ in a["params"])
-                print(f"    derived   {ds}")
+                for nm, med, p95, mx in a["params"]:
+                    rows.append([nm, "fractional", _pct(med), _pct(p95),
+                                 _pct(mx), "-", a.get("n_test", "-")])
             else:
-                print(f"    {o:<6s} {a['metric']:<8s} "
-                      f"{a['median'] * 100:6.2f}% | {a['p95'] * 100:6.2f}% | "
-                      f"{a['max'] * 100:6.1f}% | {a['within_1pct']:4.0f}%"
-                      f"   (n_test={a['n_test']})")
+                rows.append([o, a["metric"], _pct(a["median"]), _pct(a["p95"]),
+                             _pct(a["max"]), f"{a['within_1pct']:.0f}%",
+                             a["n_test"]])
+        headers = ["observable", "metric", "median", "95%", "max", "<1%", "n_test"]
+        print("held-out precision:")
+        try:
+            from tabulate import tabulate
+            print(tabulate(rows, headers=headers, tablefmt="github",
+                           colalign=("left", "left", "right", "right",
+                                     "right", "right", "right")))
+        except ImportError:  # graceful fallback if tabulate isn't installed
+            print("  " + " | ".join(headers))
+            for r in rows:
+                print("  " + " | ".join(str(c) for c in r))
 
     def __repr__(self):
         return (f"Emulator(obs={self.obs}, "

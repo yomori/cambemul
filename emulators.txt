@@ -1,0 +1,7 @@
+# One Google Drive link per line (a file link or a folder link).
+# Blank lines and lines starting with # are ignored.
+ 
+https://drive.google.com/drive/folders/19uDMpuroLjQsOSwBWKEID21IiBt4NOeP
+ 
+# Individual file links can also go here, e.g.:
+# https://drive.google.com/file/d/FILE_ID/view
