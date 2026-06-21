@@ -55,7 +55,9 @@ _CMB_UNIT_FACTORS = {
 
 
 def target_transform(obs: str) -> str:
-    return "linear" if obs in LINEAR_OBS else "log10"
+    # sign-changing cross-spectra (TE/uTE): per-feature whitening gives a far
+    # better PCA than raw 'linear' (equalizes the per-ell variance).
+    return "whiten" if obs in LINEAR_OBS else "log10"
 
 
 def fwd_transform(y, kind):
@@ -187,8 +189,17 @@ def fit(
     x_std[x_std == 0] = 1.0
     Xn = ((X - x_mean) / x_std).astype(np.float32)
 
-    # ---- target transform + (optional) PCA + standardization ----
-    T = fwd_transform(Y, transform).astype(np.float64)
+    # ---- target transform (+ optional per-feature whitening) + PCA + std ----
+    # 'whiten' = linear target divided by the per-feature (per-ell) std across
+    # the training set. Equalizes variance across ell so PCA captures small
+    # high-ell structure; essential for the sign-changing TE/uTE.
+    if transform == "whiten":
+        whiten_scale = np.asarray(Y, float).std(0)
+        whiten_scale[whiten_scale == 0] = 1.0
+        T = (np.asarray(Y, float) / whiten_scale).astype(np.float64)
+    else:
+        whiten_scale = None
+        T = fwd_transform(Y, transform).astype(np.float64)
     pca_basis = pca_mean = None
     if pca and pca < D:
         pca_mean = T.mean(0)                                   # (D,)
@@ -268,6 +279,7 @@ def fit(
         x_mean=x_mean, x_std=x_std, t_mean=t_mean, t_std=t_std,
         pca_basis=(pca_basis if pca_basis is not None else np.zeros((0, 0))),
         pca_mean=(pca_mean if pca_mean is not None else np.zeros((0,))),
+        whiten_scale=(whiten_scale if whiten_scale is not None else np.zeros((0,))),
     )
     return params, meta, best_val
 
@@ -290,19 +302,55 @@ def predict(params, meta, X):
         T = coeffs @ pca_basis.T + meta["pca_mean"]
     else:
         T = out * meta["t_std"] + meta["t_mean"]
+    if str(meta["transform"]) == "whiten":
+        ws = np.asarray(meta.get("whiten_scale", np.zeros((0,))))
+        return T * ws
     return inv_transform(T, str(meta["transform"]))
 
 
 # --------------------------------------------------------------------------- #
 # Persistence: one .npz file
 # --------------------------------------------------------------------------- #
-def save(path, params, meta, extra=None):
+_STATE_KEYS = ("flax_bytes", "config_json", "transform", "x_mean", "x_std",
+               "t_mean", "t_std", "pca_basis", "pca_mean", "whiten_scale")
+
+
+def emu_state(params, meta):
+    """Serializable dict for one emulator (weights + normalization + transform).
+
+    Factored out so a composite member (e.g. a theta-warped spectrum) can bundle
+    several inner emulators into one file by prefixing these keys.
+    """
     d = {}
     d["flax_bytes"] = np.frombuffer(serialization.to_bytes(params), dtype=np.uint8)
     d["config_json"] = json.dumps(meta["config"])
     for k in ("transform", "x_mean", "x_std", "t_mean", "t_std",
               "pca_basis", "pca_mean"):
         d[k] = meta[k]
+    d["whiten_scale"] = np.asarray(meta.get("whiten_scale", np.zeros((0,))))
+    return d
+
+
+def emu_from_state(get):
+    """Rebuild (params, meta) from a key accessor ``get(key)`` over a state dict."""
+    config = json.loads(str(get("config_json")))
+    model = build_model(config)
+    template = model.init(jax.random.PRNGKey(0),
+                          jnp.zeros((1, config["n_in"]), jnp.float32))
+    params = serialization.from_bytes(template, np.asarray(get("flax_bytes")).tobytes())
+    has = lambda k: get(k) is not None
+    meta = dict(
+        config=config, transform=str(get("transform")),
+        x_mean=get("x_mean"), x_std=get("x_std"),
+        t_mean=get("t_mean"), t_std=get("t_std"),
+        pca_basis=get("pca_basis"), pca_mean=get("pca_mean"),
+        whiten_scale=(get("whiten_scale") if has("whiten_scale") else np.zeros((0,))),
+    )
+    return params, meta
+
+
+def save(path, params, meta, extra=None):
+    d = emu_state(params, meta)
     if extra:
         d.update(extra)
     np.savez(path, **d)
@@ -310,19 +358,8 @@ def save(path, params, meta, extra=None):
 
 def load(path):
     z = np.load(path, allow_pickle=True)
-    config = json.loads(str(z["config_json"]))
-    model = build_model(config)
-    template = model.init(jax.random.PRNGKey(0),
-                          jnp.zeros((1, config["n_in"]), jnp.float32))
-    params = serialization.from_bytes(template, z["flax_bytes"].tobytes())
-    meta = dict(
-        config=config, transform=str(z["transform"]),
-        x_mean=z["x_mean"], x_std=z["x_std"], t_mean=z["t_mean"], t_std=z["t_std"],
-        pca_basis=z["pca_basis"], pca_mean=z["pca_mean"],
-    )
-    skip = {"flax_bytes", "config_json", "transform", "x_mean", "x_std",
-            "t_mean", "t_std", "pca_basis", "pca_mean"}
-    extra = {k: z[k] for k in z.files if k not in skip}
+    params, meta = emu_from_state(lambda k: z[k] if k in z.files else None)
+    extra = {k: z[k] for k in z.files if k not in _STATE_KEYS}
     return params, meta, extra
 
 
@@ -363,19 +400,25 @@ class Emulator:
     >>> out['TT'].shape, e.ell.shape                  # C_ell per multipole
     """
 
-    def __init__(self, members):
-        # members: {obs: (params, meta, extra)}
+    def __init__(self, members, warped=None, theta=None):
+        # members: {obs: (params, meta, extra)} (plain);
+        # warped:  {obs: (warp_member_dict, extra)} (theta-warped spectra);
+        # theta:   (params, meta) of the embedded 100*theta* emulator, or None.
         self.members = dict(members)
-        self.obs = list(self.members)
+        self._warped = dict(warped or {})
+        self._theta = theta
+        self.obs = list(self.members) + list(self._warped)
 
+        # extras for every spectrum member (plain + warped) for shared metadata
+        extras = ([(o, ex) for o, (_, _, ex) in self.members.items()]
+                  + [(o, ex) for o, (_, ex) in self._warped.items()])
         names = None
-        for o, (_, _, ex) in self.members.items():
+        for o, ex in extras:
             nm = [str(x) for x in ex["param_names"]]
             if names is None:
                 names = nm
             elif nm != names:
-                raise ValueError(
-                    f"emulator '{o}' has param_names {nm} != {names}")
+                raise ValueError(f"emulator '{o}' has param_names {nm} != {names}")
         self.param_names = names
 
         # grids + derived scalar names
@@ -389,10 +432,12 @@ class Emulator:
                 self.derived_names = [str(x) for x in ex["derived_names"]]
             elif "ell" in ex:
                 self.ell = ex["ell"]
+        for o, (member, ex) in self._warped.items():
+            self.ell = np.asarray(member["ell"])
 
         # held-out precision recorded at train time (optional)
         self.accuracy = {}
-        for o, (_, _, ex) in self.members.items():
+        for o, ex in extras:
             aj = ex.get("accuracy_json")
             if aj is not None:
                 try:
@@ -493,6 +538,17 @@ class Emulator:
                     out[nm] = float(Y[0, j]) if scalar else Y[:, j]
             else:
                 out[_out_key(o)] = Y[0] if scalar else Y
+        # theta-warped spectra: get each cosmology's theta* from the embedded
+        # theta emulator, then warp-predict + un-warp (transparent to the user).
+        if self._warped:
+            if self._theta is None:
+                raise RuntimeError(
+                    "warped spectra need an embedded theta emulator (emu_theta.npz)")
+            from . import warp as _warp
+            theta = np.asarray(predict(*self._theta, X)).ravel()   # 100*theta*
+            for o, (member, ex) in self._warped.items():
+                Y = _warp.predict_warped(member, X, theta)
+                out[_out_key(o)] = Y[0] if scalar else Y
         return out
 
     def get_derived(self, pars):
@@ -539,17 +595,28 @@ def loademul(path, verbose=True):
     import glob
     import os
 
-    members = {}
+    from . import warp as _warp
+
     if os.path.isdir(path):
         files = sorted(glob.glob(os.path.join(path, "emu_*.npz")))
         if not files:
             raise FileNotFoundError(f"no emu_*.npz files in {path}")
     else:
         files = [path]
+    members, warped, theta = {}, {}, None
     for f in files:
+        z = np.load(f, allow_pickle=True)
+        if _warp.is_warped_file(z):
+            member, extra = _warp.load_warped(z)
+            warped[member["obs"]] = (member, extra)
+            continue
         params, meta, extra = load(f)
-        members[str(extra["obs"])] = (params, meta, extra)
-    emu = Emulator(members)
+        o = str(extra["obs"])
+        if o == "theta":          # embedded theta* emulator, not a spectrum
+            theta = (params, meta)
+        else:
+            members[o] = (params, meta, extra)
+    emu = Emulator(members, warped=warped, theta=theta)
     if verbose:
         emu.print_precision()
     return emu
