@@ -24,6 +24,7 @@ from cambemul.dataset import load_store, read_obs, read_param_names  # noqa: E40
 from cambemul.emulator import (  # noqa: E402
     accuracy_report, fit, predict, save, target_transform,
 )
+from cambemul import warp as warp_mod  # noqa: E402
 
 
 def main():
@@ -34,7 +35,11 @@ def main():
     ap.add_argument("--obs", default=None, help="comma list (default: all in file)")
     ap.add_argument("--out-dir", default="emulators")
     ap.add_argument("--arch", default="mlp", choices=["mlp", "resnet", "cnn"])
-    ap.add_argument("--pca", type=int, default=0, help="emulate top-K PCA coeffs (0=off)")
+    ap.add_argument("--pca", type=int, default=None,
+                    help="emulate top-K PCA coeffs for ALL obs (overrides the tuned "
+                         "per-obs map; 0=full spectrum). Default: tuned map.")
+    ap.add_argument("--pca-map", default=None,
+                    help="per-obs rank override, e.g. 'PP=8,TE=16'")
     ap.add_argument("--width", type=int, default=256)
     ap.add_argument("--depth", type=int, default=4)
     ap.add_argument("--epochs", type=int, default=500)
@@ -46,7 +51,26 @@ def main():
                          "stored in (and printed on load of) each emulator")
     ap.add_argument("--patience", type=int, default=50)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--no-warp", action="store_true",
+                    help="disable the acoustic-scale warp for EE/TE/uEE/uTE "
+                         "(on by default; needs CAMB for theta*)")
     args = ap.parse_args()
+
+    # Tuned per-observable PCA rank: low-dimensional PP wants ~8; the CMB spectra
+    # ~16 (see the rank study). --pca overrides all; --pca-map overrides per-obs.
+    TUNED_RANK = {"PP": 8}
+    pca_override = {}
+    if args.pca_map:
+        for kv in args.pca_map.split(","):
+            k, v = kv.split("=")
+            pca_override[k.strip()] = int(v)
+
+    def rank_for(o):
+        if o in pca_override:
+            return pca_override[o]
+        if args.pca is not None:
+            return args.pca
+        return TUNED_RANK.get(o, 16)
 
     store = load_store(args.train)
     X = store["params"]
@@ -67,20 +91,68 @@ def main():
     print(f"  N={Ntot}  ({len(tr_idx)} train / {len(te_idx)} held-out)  "
           f"params={param_names}")
     print(f"  obs in file: {file_obs} -> training: {obs}")
-    print(f"  arch={args.arch}  pca={args.pca}  width={args.width}  depth={args.depth}")
+    rank_str = "  ".join(f"{o}:{rank_for(o)}" for o in obs if o in file_obs)
+    print(f"  arch={args.arch}  width={args.width}  depth={args.depth}  ranks: {rank_str}")
+
+    fitkw = dict(arch=args.arch, width=args.width, depth=args.depth, epochs=args.epochs,
+                 lr=args.lr, batch=args.batch, val_frac=args.val_frac,
+                 patience=args.patience, seed=args.seed)
+
+    # Acoustic-scale warp for EE/TE/uEE/uTE (default on). Needs theta* per
+    # cosmology (CAMB) + an embedded theta* emulator the Emulator uses at predict.
+    warped_obs = ([o for o in obs if o in file_obs and warp_mod.uses_warp(o)]
+                  if not args.no_warp else [])
+    theta_tr = theta_te = None
+    if warped_obs:
+        cache = (os.path.join(args.train, "theta_100.npy") if os.path.isdir(args.train)
+                 else os.path.splitext(args.train)[0] + ".theta_100.npy")
+        if os.path.exists(cache) and len(np.load(cache)) == Ntot:
+            theta_all = np.load(cache)
+            print(f"  warp: theta* loaded from cache ({cache})")
+        else:
+            print("  warp: computing theta* via CAMB "
+                  "(run with OMP_NUM_THREADS=1 NPROC=<ncores> for speed) ...")
+            theta_all = warp_mod.compute_theta(X)
+            np.save(cache, theta_all)
+        theta_tr, theta_te = theta_all[tr_idx], theta_all[te_idx]
+        pt, mt, _ = fit(Xtr, theta_tr[:, None], transform="linear",
+                        **{**fitkw, "epochs": max(args.epochs, 600), "width": 128, "depth": 3})
+        terr = np.abs(predict(pt, mt, Xte).ravel() - theta_te) / theta_te
+        save(os.path.join(args.out_dir, "emu_theta.npz"), pt, mt,
+             extra=dict(obs="theta", param_names=param_names,
+                        accuracy_json=json.dumps(dict(
+                            metric="theta_frac", median=float(np.median(terr)),
+                            p95=float(np.percentile(terr, 95))))))
+        print(f"  theta* emulator: median frac err={np.median(terr) * 100:.4f}%"
+              f"  ->  emu_theta.npz   (warped: {warped_obs})")
 
     for o in obs:
         if o not in file_obs:
             print(f"  [skip {o}] not in training file")
             continue
         Y = store[o]
+        rank = rank_for(o)
+        out = os.path.join(args.out_dir, f"emu_{o}.npz")
+
+        if o in warped_obs:
+            print(f"\n=== {o}  (theta-warp[{warp_mod._outer(o)}], pca={rank}, "
+                  f"D={Y.shape[1]}) ===")
+            mem = warp_mod.train_warped(Xtr, Y[tr_idx], theta_tr, store["ell"], o,
+                                        rank=rank, **fitkw)
+            acc = accuracy_report(o, Y[te_idx],
+                                  warp_mod.predict_warped(mem, Xte, theta_te),
+                                  ell=store["ell"])
+            warp_mod.save_warped(out, mem, extra=dict(
+                param_names=param_names, lmin=store["lmin"], lmax=store["lmax"],
+                accuracy_json=json.dumps(acc)))
+            print(f"  held-out {acc['metric']}: median={acc['median'] * 100:.2f}% "
+                  f"95%={acc['p95'] * 100:.2f}%  ->  {out}")
+            continue
+
         transform = target_transform(o)
-        print(f"\n=== {o}  (transform={transform}, D={Y.shape[1]}) ===")
+        print(f"\n=== {o}  (transform={transform}, pca={rank}, D={Y.shape[1]}) ===")
         params, meta, best_val = fit(
-            Xtr, Y[tr_idx], transform=transform, arch=args.arch, pca=args.pca,
-            width=args.width, depth=args.depth, epochs=args.epochs, lr=args.lr,
-            batch=args.batch, val_frac=args.val_frac, patience=args.patience,
-            seed=args.seed,
+            Xtr, Y[tr_idx], transform=transform, pca=rank, **fitkw,
         )
         ell_grid = None if o == "Pk" else store["ell"]
         acc = accuracy_report(o, Y[te_idx], predict(params, meta, Xte), ell=ell_grid)
@@ -90,7 +162,6 @@ def main():
             extra.update(kh=store["kh"], z=store["z"], Pk_shape=store["Pk_shape"])
         else:
             extra.update(ell=store["ell"])
-        out = os.path.join(args.out_dir, f"emu_{o}.npz")
         save(out, params, meta, extra=extra)
         print(f"  best val_mse={best_val:.4e}  |  held-out {acc['metric']}: "
               f"median={acc['median'] * 100:.2f}% 95%={acc['p95'] * 100:.2f}% "
